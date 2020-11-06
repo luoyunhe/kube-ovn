@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"strings"
 	"time"
 
 	"k8s.io/client-go/kubernetes/scheme"
@@ -95,6 +96,7 @@ func NewController(config *Configuration, informerFactory informers.SharedInform
 	controller.protocol = util.CheckProtocol(node.Annotations[util.IpAddressAnnotation])
 	controller.internalIP = getNodeInternalIP(node)
 
+	// how to adjust dualstack for iptables
 	if controller.protocol == kubeovnv1.ProtocolIPv4 {
 		iptable, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
 		if err != nil {
@@ -191,10 +193,21 @@ func (c *Controller) reconcileRouters() error {
 		if !subnet.Status.IsReady() || subnet.Spec.UnderlayGateway {
 			continue
 		}
-		if _, ipNet, err := net.ParseCIDR(subnet.Spec.CIDRBlock); err != nil {
-			klog.Errorf("%s is not a valid cidr block", subnet.Spec.CIDRBlock)
+		if util.CheckProtocol(subnet.Spec.CIDRBlock) == kubeovnv1.ProtocolDual {
+			cidrBlocks := strings.Split(subnet.Spec.CIDRBlock, ",")
+			for i := 0; i < len(cidrBlocks); i++ {
+				if _, ipNet, err := net.ParseCIDR(cidrBlocks[i]); err != nil {
+					klog.Errorf("%s is not a valid cidr block", cidrBlocks[i])
+				} else {
+					cidrs = append(cidrs, ipNet.String())
+				}
+			}
 		} else {
-			cidrs = append(cidrs, ipNet.String())
+			if _, ipNet, err := net.ParseCIDR(subnet.Spec.CIDRBlock); err != nil {
+				klog.Errorf("%s is not a valid cidr block", subnet.Spec.CIDRBlock)
+			} else {
+				cidrs = append(cidrs, ipNet.String())
+			}
 		}
 	}
 	node, err := c.config.KubeClient.CoreV1().Nodes().Get(c.config.NodeName, metav1.GetOptions{})
@@ -213,6 +226,7 @@ func (c *Controller) reconcileRouters() error {
 		return fmt.Errorf("failed to get nic %s", util.NodeNic)
 	}
 
+	// how to adapt RouteList for dualstack???
 	var existRoutes []netlink.Route
 	if util.CheckProtocol(gateway) == kubeovnv1.ProtocolIPv4 {
 		existRoutes, err = netlink.RouteList(nic, netlink.FAMILY_V4)
