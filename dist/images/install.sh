@@ -38,12 +38,16 @@ VLAN_RANGE="1,4095"
 DPDK="false"
 DPDK_SUPPORTED_VERSIONS=("19.11")
 DPDK_VERSION=""
+DPDK_CPU="1000m"                        # Default CPU configuration for if --dpdk-cpu flag is not included
+DPDK_MEMORY="2Gi"                       # Default Memory configuration for it --dpdk-memory flag is not included
 
 display_help() {
     echo "Usage: $0 [option...]"
     echo
     echo "  -h, --help               Print Help (this message) and exit"
     echo "  --with-dpdk=<version>    Install Kube-OVN with OVS-DPDK instead of kernel OVS"
+    echo "  --dpdk-cpu=<amount>m     Configure DPDK to use a specific amount of CPU"
+    echo "  --dpdk-memory=<amount>Gi Configure DPDK to use a specific amount of memory"
     echo
     exit 0
 }
@@ -63,6 +67,26 @@ then
           echo "Unsupported DPDK version: ${DPDK_VERSION}"
           echo "Supported DPDK versions: ${DPDK_SUPPORTED_VERSIONS[*]}"
           exit 1
+        fi
+      ;;
+      --dpdk-cpu=*)
+        DPDK_CPU="${1#*=}"
+        if [[ $DPDK_CPU =~ ^[0-9]+(m)$ ]]
+        then
+           echo "CPU $DPDK_CPU"
+        else
+           echo "$DPDK_CPU is not valid, please use the format --dpdk-cpu=<amount>m"
+           exit 1
+        fi
+      ;;
+      --dpdk-memory=*)
+        DPDK_MEMORY="${1#*=}"
+        if [[ $DPDK_MEMORY =~ ^[0-9]+(Gi)$ ]]
+        then
+           echo "MEMORY $DPDK_MEMORY"
+        else
+           echo "$DPDK_MEMORY is not valid, please use the format --dpdk-memory=<amount>Gi"
+           exit 1
         fi
       ;;
       -?*)
@@ -127,6 +151,17 @@ spec:
                 namespaces:
                   items:
                     type: string
+                  type: array
+                staticRoutes:
+                  items:
+                    properties:
+                      policy:
+                        type: string
+                      cidr:
+                        type: string
+                      nextHopIP:
+                        type: string
+                    type: object
                   type: array
               type: object
             status:
@@ -194,9 +229,6 @@ spec:
       served: true
       storage: true
       additionalPrinterColumns:
-      - name: Provider
-        type: string
-        jsonPath: .spec.provider
       - name: IP
         type: string
         jsonPath: .spec.ipAddress
@@ -263,6 +295,9 @@ spec:
       subresources:
         status: {}
       additionalPrinterColumns:
+      - name: Provider
+        type: string
+        jsonPath: .spec.provider
       - name: Vpc
         type: string
         jsonPath: .spec.vpc
@@ -614,7 +649,6 @@ spec:
     spec:
       tolerations:
       - operator: Exists
-        effect: NoSchedule
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -802,7 +836,6 @@ spec:
     spec:
       tolerations:
       - operator: Exists
-        effect: NoSchedule
       priorityClassName: system-cluster-critical
       serviceAccountName: ovn
       hostNetwork: true
@@ -869,11 +902,11 @@ spec:
             timeoutSeconds: 45
           resources:
             requests:
-              cpu: 500m
-              memory: 2Gi
+              cpu: $DPDK_CPU
+              memory: $DPDK_MEMORY
             limits:
-              cpu: 1000m
-              memory: 2Gi
+              cpu: $DPDK_CPU
+              memory: $DPDK_MEMORY
               hugepages-1Gi: 1Gi
       nodeSelector:
         kubernetes.io/os: "linux"
@@ -1112,7 +1145,6 @@ spec:
     spec:
       tolerations:
       - operator: Exists
-        effect: NoSchedule
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -1299,7 +1331,6 @@ spec:
     spec:
       tolerations:
       - operator: Exists
-        effect: NoSchedule
       priorityClassName: system-cluster-critical
       serviceAccountName: ovn
       hostNetwork: true
@@ -1440,7 +1471,6 @@ spec:
     spec:
       tolerations:
       - operator: Exists
-        effect: NoSchedule
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -1528,7 +1558,6 @@ spec:
     spec:
       tolerations:
       - operator: Exists
-        effect: NoSchedule
       priorityClassName: system-cluster-critical
       serviceAccountName: ovn
       hostNetwork: true
@@ -1645,7 +1674,6 @@ spec:
     spec:
       tolerations:
         - operator: Exists
-          effect: NoSchedule
       serviceAccountName: ovn
       hostPID: true
       containers:
@@ -1982,6 +2010,10 @@ diagnose(){
         echo "#### ovn-controller log:"
         kubectl exec -n $KUBE_OVN_NS -it "$pinger" -- tail /var/log/ovn/ovn-controller.log
         echo ""
+        echo "#### ovs-vsctl show results:"
+        kubectl exec -n $KUBE_OVN_NS -it "$pinger" -- ovs-vsctl show
+        echo ""
+        echo "#### pinger diagnose results:"
         kubectl exec -n $KUBE_OVN_NS -it "$pinger" -- /kube-ovn/kube-ovn-pinger --mode=job
         echo "### finish diagnose node $nodeName"
         echo ""

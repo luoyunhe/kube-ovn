@@ -1,6 +1,25 @@
 #!/bin/bash
 set -eo pipefail
 
+# https://bugs.launchpad.net/neutron/+bug/1776778
+if grep -q "3.10.0-862" /proc/version
+then
+    echo "kernel version 3.10.0-862 has a nat related bug that will affect ovs function, please update to a version greater than 3.10.0-898"
+    exit 1
+fi
+
+# https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1794232
+if [ ! -f "/proc/net/if_inet6" ] && grep -q "3.10" /proc/version ; then
+    echo "geneve requires ipv6, please add ipv6.disable=0 to kernel follow the instruction below:"
+    echo "
+vi /etc/default/grub
+find GRUB_CMDLINE_LINUX=  and change ipv6.disable=1 to ipv6.disable=0
+grub2-mkconfig -o /boot/grub2/grub.cfg
+reboot
+cat /proc/cmdline"
+    exit 1
+fi
+
 DB_NB_ADDR=${DB_NB_ADDR:-::}
 DB_NB_PORT=${DB_NB_PORT:-6641}
 DB_SB_ADDR=${DB_SB_ADDR:-::}
@@ -53,6 +72,10 @@ if [[ "$ENABLE_SSL" == "false" ]]; then
       ovn-sbctl set-connection ptcp:"${DB_SB_PORT}":["${DB_SB_ADDR}"]
       ovn-sbctl set Connection . inactivity_probe=0
   else
+      if [[ ! "$NODE_IPS" =~ "$POD_IP" ]]; then
+        echo "ERROR! host ip $POD_IP not in env NODE_IPS $NODE_IPS"
+        exit 1
+      fi
       /usr/share/ovn/scripts/ovn-ctl stop_northd
 
       nb_leader_ip=$(get_leader_ip nb)
@@ -116,6 +139,10 @@ else
       ovn-sbctl -p /var/run/tls/key -c /var/run/tls/cert -C /var/run/tls/cacert set-connection pssl:"${DB_SB_PORT}":["${DB_SB_ADDR}"]
       ovn-sbctl -p /var/run/tls/key -c /var/run/tls/cert -C /var/run/tls/cacert set Connection . inactivity_probe=0
   else
+      if [[ ! "$NODE_IPS" =~ "$POD_IP" ]]; then
+        echo "ERROR! host ip $POD_IP not in env NODE_IPS $NODE_IPS"
+        exit 1
+      fi
       /usr/share/ovn/scripts/ovn-ctl stop_northd
 
       nb_leader_ip=$(get_leader_ip nb)

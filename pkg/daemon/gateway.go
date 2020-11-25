@@ -2,32 +2,35 @@ package daemon
 
 import (
 	"fmt"
+	"net"
+	"os"
+	"strings"
+
 	kubeovnv1 "github.com/alauda/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/alauda/kube-ovn/pkg/ovs"
 	"github.com/alauda/kube-ovn/pkg/util"
 	"github.com/projectcalico/felix/ipsets"
 	"github.com/vishvananda/netlink"
+	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog"
-	"net"
-	"os"
-	"strings"
 )
 
 const (
 	SubnetSet    = "subnets"
 	SubnetNatSet = "subnets-nat"
 	LocalPodSet  = "local-pod-ip-nat"
+	OtherNodeSet = "other-node"
 	IPSetPrefix  = "ovn"
 )
 
 var (
 	v4Rules = []util.IPTableRule{
 		// Prevent performing Masquerade on external traffic which arrives from a Node that owns the Pod/Subnet IP
-		{Table: "nat", Chain: "POSTROUTING", Rule: strings.Split(`-m set ! --match-set ovn40subnets src -m set --match-set ovn40local-pod-ip-nat dst -j RETURN`, " ")},
-		{Table: "nat", Chain: "POSTROUTING", Rule: strings.Split(`-m set ! --match-set ovn40subnets src -m set --match-set ovn40subnets-nat dst -j RETURN`, " ")},
+		{Table: "nat", Chain: "POSTROUTING", Rule: strings.Split(`-m set ! --match-set ovn40subnets src -m set ! --match-set ovn40other-node src -m set --match-set ovn40local-pod-ip-nat dst -j RETURN`, " ")},
+		{Table: "nat", Chain: "POSTROUTING", Rule: strings.Split(`-m set ! --match-set ovn40subnets src -m set ! --match-set ovn40other-node src -m set --match-set ovn40subnets-nat dst -j RETURN`, " ")},
 		// NAT if pod/subnet to external address
 		{Table: "nat", Chain: "POSTROUTING", Rule: strings.Split(`-m set --match-set ovn40local-pod-ip-nat src -m set ! --match-set ovn40subnets dst -j MASQUERADE`, " ")},
 		{Table: "nat", Chain: "POSTROUTING", Rule: strings.Split(`-m set --match-set ovn40subnets-nat src -m set ! --match-set ovn40subnets dst -j MASQUERADE`, " ")},
@@ -40,8 +43,8 @@ var (
 	}
 	v6Rules = []util.IPTableRule{
 		// Prevent performing Masquerade on external traffic which arrives from a Node that owns the Pod/Subnet IP
-		{Table: "nat", Chain: "POSTROUTING", Rule: strings.Split(`-m set ! --match-set ovn40subnets src -m set --match-set ovn60local-pod-ip-nat dst -j RETURN`, " ")},
-		{Table: "nat", Chain: "POSTROUTING", Rule: strings.Split(`-m set ! --match-set ovn40subnets src -m set --match-set ovn60subnets-nat dst -j RETURN`, " ")},
+		{Table: "nat", Chain: "POSTROUTING", Rule: strings.Split(`-m set ! --match-set ovn60subnets src -m set ! --match-set ovn60other-node src  -m set --match-set ovn60local-pod-ip-nat dst -j RETURN`, " ")},
+		{Table: "nat", Chain: "POSTROUTING", Rule: strings.Split(`-m set ! --match-set ovn60subnets src -m set ! --match-set ovn60other-node src  -m set --match-set ovn60subnets-nat dst -j RETURN`, " ")},
 		// NAT if pod/subnet to external address
 		{Table: "nat", Chain: "POSTROUTING", Rule: strings.Split(`-m set --match-set ovn60local-pod-ip-nat src -m set ! --match-set ovn60subnets dst -j MASQUERADE`, " ")},
 		{Table: "nat", Chain: "POSTROUTING", Rule: strings.Split(`-m set --match-set ovn60subnets-nat src -m set ! --match-set ovn60subnets dst -j MASQUERADE`, " ")},
@@ -70,6 +73,11 @@ func (c *Controller) runGateway() {
 		klog.Errorf("get need nat subnets failed, %+v", err)
 		return
 	}
+	otherNode, err := c.getOtherNodes(c.protocol)
+	if err != nil {
+		klog.Errorf("failed to get node, %+v", err)
+		return
+	}
 	c.ipset.AddOrReplaceIPSet(ipsets.IPSetMetadata{
 		MaxSize: 1048576,
 		SetID:   SubnetSet,
@@ -85,6 +93,11 @@ func (c *Controller) runGateway() {
 		SetID:   SubnetNatSet,
 		Type:    ipsets.IPSetTypeHashNet,
 	}, subnetsNeedNat)
+	c.ipset.AddOrReplaceIPSet(ipsets.IPSetMetadata{
+		MaxSize: 1048576,
+		SetID:   OtherNodeSet,
+		Type:    ipsets.IPSetTypeHashNet,
+	}, otherNode)
 	c.ipset.ApplyUpdates()
 
 	var iptableRules []util.IPTableRule
@@ -227,6 +240,7 @@ func (c *Controller) getLocalPodIPsNeedNAT(protocol string) ([]string, error) {
 		nsGWType := subnet.Spec.GatewayType
 		nsGWNat := subnet.Spec.NatOutgoing
 		if nsGWNat &&
+			subnet.Spec.Vpc == util.DefaultVpc &&
 			nsGWType == kubeovnv1.GWDistributedType &&
 			pod.Spec.NodeName == hostname &&
 			util.CheckProtocol(pod.Status.PodIP) == protocol {
@@ -246,7 +260,8 @@ func (c *Controller) getSubnetsNeedNAT(protocol string) ([]string, error) {
 		return nil, err
 	}
 	for _, subnet := range subnets {
-		if subnet.Spec.GatewayType == kubeovnv1.GWCentralizedType &&
+		if subnet.Spec.Vpc == util.DefaultVpc &&
+			subnet.Spec.GatewayType == kubeovnv1.GWCentralizedType &&
 			subnet.Status.ActivateGateway == c.config.NodeName &&
 			subnet.Spec.Protocol == protocol &&
 			subnet.Spec.NatOutgoing {
@@ -267,8 +282,30 @@ func (c *Controller) getSubnetsCIDR(protocol string) ([]string, error) {
 		return nil, err
 	}
 	for _, subnet := range subnets {
-		if subnet.Spec.Protocol == protocol {
+		if subnet.Spec.Protocol == protocol && subnet.Spec.Vpc == util.DefaultVpc {
 			ret = append(ret, subnet.Spec.CIDRBlock)
+		}
+	}
+	return ret, nil
+}
+
+func (c *Controller) getOtherNodes(protocol string) ([]string, error) {
+	nodes, err := c.nodesLister.List(labels.Everything())
+	if err != nil {
+		klog.Error("failed to list nodes")
+		return nil, err
+	}
+	ret := make([]string, 0, len(nodes)-1)
+	for _, node := range nodes {
+		if node.Name == c.config.NodeName {
+			continue
+		}
+		for _, addr := range node.Status.Addresses {
+			if addr.Type == v1.NodeInternalIP {
+				if util.CheckProtocol(addr.Address) == protocol {
+					ret = append(ret, addr.Address)
+				}
+			}
 		}
 	}
 	return ret, nil
